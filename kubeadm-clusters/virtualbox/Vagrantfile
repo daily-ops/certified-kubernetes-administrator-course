@@ -11,12 +11,12 @@ BUILD_MODE = "BRIDGE"
 
 # Define the number of worker nodes
 # If this number is changed, remember to update setup-hosts.sh script with the new hosts IP details in /etc/hosts of each VM.
-NUM_WORKER_NODES = 2
+NUM_WORKER_NODES = 3
 
 # Network parameters for NAT mode
-IP_NW = "192.168.56"
-MASTER_IP_START = 11
-NODE_IP_START = 20
+IP_NW = "192.168.0"
+MASTER_IP_START = 200
+NODE_IP_START = 201
 
 # Host operating sysem detection
 module OS
@@ -46,7 +46,7 @@ def get_bridge_adapter()
   if OS.windows?
     return %x{powershell -Command "Get-NetRoute -DestinationPrefix 0.0.0.0/0 | Get-NetAdapter | Select-Object -ExpandProperty InterfaceDescription"}.chomp
   elsif OS.linux?
-    return %x{ip route | grep default | awk '{ print $5 }'}.chomp
+    return %x{ip route | grep default | awk '{ print $5 }' | grep -v -e "^wl"}.chomp
   elsif OS.mac?
     return %x{mac/mac-bridge.sh}.chomp
   end
@@ -112,6 +112,7 @@ Vagrant.configure("2") do |config|
   config.vm.box = "ubuntu/jammy64"
   config.vm.boot_timeout = 900
 
+
   # Disable automatic box update checking. If you disable this, then
   # boxes will only be checked for updates when the user runs
   # `vagrant box outdated`. This is not recommended.
@@ -128,7 +129,7 @@ Vagrant.configure("2") do |config|
     node.vm.hostname = "controlplane"
     if BUILD_MODE == "BRIDGE"
       adapter = ""
-      node.vm.network :public_network, bridge: get_bridge_adapter()
+      node.vm.network :public_network, bridge: get_bridge_adapter(), ip: IP_NW + ".#{MASTER_IP_START}"
     else
       node.vm.network :private_network, ip: IP_NW + ".#{MASTER_IP_START}"
       node.vm.network "forwarded_port", guest: 22, host: "#{2710}"
@@ -137,7 +138,29 @@ Vagrant.configure("2") do |config|
     # Install (opinionated) configs for vim and tmux on master-1. These used by the author for CKA exam.
     node.vm.provision "file", source: "./ubuntu/tmux.conf", destination: "$HOME/.tmux.conf"
     node.vm.provision "file", source: "./ubuntu/vimrc", destination: "$HOME/.vimrc"
+
+    if BUILD_MODE == "BRIDGE"
+      node.vm.provision "shell", inline: "useradd -s /bin/bash -m ansible"
+      node.vm.provision "file", source: "~/.ssh/id_rsa.pub", destination: "/tmp/authorized_keys"
+      node.vm.provision "shell", inline: "mkdir /home/ansible/.ssh && mv /tmp/authorized_keys /home/ansible/.ssh/ && chown ansible:ansible /home/ansible/.ssh/authorized_keys"
+      node.vm.provision :shell do |s|
+        s.path = 'ubuntu/ansible/setup.sh'
+      end
+    end
+    node.vm.provision :shell do |s|
+      s.path = 'ubuntu/setup-kernel.sh'
+    end
+
+    if BUILD_MODE == "BRIDGE"
+        node.trigger.after :up do |trigger|
+          trigger.info = "Append master node to known_hosts file"
+          tmp_ip = IP_NW + ".#{MASTER_IP_START}"
+
+          trigger.run = {path: "./ubuntu/ansible/known_hosts.sh", args: "#{tmp_ip}"}
+        end
+    end
   end
+
 
   # Provision Worker Nodes
   (1..NUM_WORKER_NODES).each do |i|
@@ -149,12 +172,32 @@ Vagrant.configure("2") do |config|
       end
       node.vm.hostname = "node0#{i}"
       if BUILD_MODE == "BRIDGE"
-        node.vm.network :public_network, bridge: get_bridge_adapter()
+        node.vm.network :public_network, bridge: get_bridge_adapter(), ip: IP_NW + ".#{NODE_IP_START + i}"
       else
         node.vm.network :private_network, ip: IP_NW + ".#{NODE_IP_START + i}"
         node.vm.network "forwarded_port", guest: 22, host: "#{2720 + i}"
       end
       provision_kubernetes_node node
+
+      if BUILD_MODE == "BRIDGE"
+        node.vm.provision "shell", inline: "useradd -s /bin/bash -m ansible"
+        node.vm.provision "file", source: "~/.ssh/id_rsa.pub", destination: "/tmp/authorized_keys"
+        node.vm.provision "shell", inline: "mkdir /home/ansible/.ssh && mv /tmp/authorized_keys /home/ansible/.ssh/ && chown ansible:ansible /home/ansible/.ssh/authorized_keys"
+        node.vm.provision :shell do |s|
+          s.path = 'ubuntu/ansible/setup.sh'
+        end
+      end
+      node.vm.provision :shell do |s|
+        s.path = 'ubuntu/setup-kernel.sh'
+      end
+
+      if BUILD_MODE == "BRIDGE"
+        node.trigger.after :up do |trigger|
+          trigger.info = "Append node to known_hosts file"
+          tmp_ip = IP_NW + ".#{NODE_IP_START + i}"
+          trigger.run = {path: "./ubuntu/ansible/known_hosts.sh", args: "#{tmp_ip}"}
+        end
+      end
     end
   end
 
@@ -169,14 +212,14 @@ Vagrant.configure("2") do |config|
       trigger.ruby do |env, machine|
         if all_nodes_up()
           puts "    Gathering IP addresses of nodes..."
-          nodes = ["controlplane"]
           ips = []
+          nodes = ["controlplane"]
+          ips.push(IP_NW + ".#{MASTER_IP_START}")
           (1..NUM_WORKER_NODES).each do |i|
             nodes.push("node0#{i}")
+            ips.push(IP_NW + ".#{NODE_IP_START + i}")
           end
-          nodes.each do |n|
-            ips.push(%x{vagrant ssh #{n} -c 'public-ip'}.chomp)
-          end
+
           hosts = ""
           ips.each_with_index do |ip, i|
             hosts << ip << "  " << nodes[i] << "\n"
@@ -188,6 +231,27 @@ Vagrant.configure("2") do |config|
             system("vagrant ssh #{node} -c 'cat /tmp/hosts.tmp | sudo tee -a /etc/hosts'")
           end
           File.delete("hosts.tmp")
+
+          puts "Populate ansible inventory at ubuntu/ansible/inventory"
+          nodes_group = ""
+          nodes_group << "[master]" << "\n"
+
+          tmp_ip = IP_NW + ".#{MASTER_IP_START}"
+          nodes_group << IP_NW + ".#{MASTER_IP_START}" << "\n\n"
+
+          nodes_group << "[workers]" << "\n"
+          (1..NUM_WORKER_NODES).each do |i|
+            tmp_ip = IP_NW + ".#{NODE_IP_START + i}"
+            nodes_group << IP_NW + ".#{NODE_IP_START + i}" << "\n"
+          end
+
+          File.open("ubuntu/ansible/inventory", "w") { |file| file.write(nodes_group) }
+
+          puts "    You may now use the inventory to manage the boxes:"
+          puts "        ansible -i ubuntu/ansible/inventory -m ping all"
+          puts "        ansible -i ubuntu/ansible/inventory -m ping master"
+          puts "        ansible -i ubuntu/ansible/inventory -m ping workers"
+
           puts <<~EOF
 
                  VM build complete!

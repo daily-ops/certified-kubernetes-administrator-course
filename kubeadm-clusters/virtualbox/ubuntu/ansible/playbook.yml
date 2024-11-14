@@ -1,0 +1,126 @@
+---
+- hosts: all
+  become: yes
+  tasks:
+    - name: Set architecture specific variables
+      set_fact:
+        arch: "{{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}"
+  
+    - name: Manage kubeadm repository
+      block:
+          # To be removed if the setup is done through pre-configured image
+        - name: kubeadm repository keyring
+          ansible.builtin.get_url:
+            url: https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key
+            dest: /usr/share/keyrings/kubeadm-archive-keyring.gpg.armored
+
+          # To be removed if the setup is done through pre-configured image
+        - name: De-Armor kubeadm GPG key
+          shell: gpg --dearmor < /usr/share/keyrings/kubeadm-archive-keyring.gpg.armored > /usr/share/keyrings/kubeadm-archive-keyring.gpg
+          args:
+              creates: /usr/share/keyrings/kubeadm-archive-keyring.gpg
+
+          # To be removed if the setup is done through pre-configured image
+        - name: kubeadm repository
+          ansible.builtin.apt_repository:
+            repo: "deb [arch={{arch}} signed-by=/usr/share/keyrings/kubeadm-archive-keyring.gpg]  https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /"
+            state: present
+            filename: kubeadm
+            update_cache: false
+
+          # To be removed if the setup is done through pre-configured image
+        - name: Install kubeadm
+          apt:
+            name: "{{ packages }}"
+            state: present
+            update_cache: true
+          vars:
+            packages:
+              - kubeadm
+              - kubelet
+              - containerd
+
+          # To be removed if the setup is done through pre-configured image
+        - name: Containerd directory
+          file: 
+            path: /etc/containerd
+            state: directory
+
+          # To be removed if the setup is done through pre-configured image
+        - name: Generate containerd config file
+          shell: containerd config default | sed 's/SystemdCgroup = false/SystemdCgroup = true/' | tee /etc/containerd/config.toml
+          args:
+            creates: /etc/containerd/config.toml
+
+          # To be removed if the setup is done through pre-configured image
+        - name: Restart containerd
+          command: systemctl restart containerd
+          
+- hosts: master
+  become: yes
+  vars:
+    pod_network_cidr: "10.245.0.0/16"
+    pod_subnet: "10.245.0.1/24"
+    service_network_cidr: "10.97.0.0/16"
+  tasks:
+        # To be removed if the setup is done through pre-configured image
+        - name: Install kubectl
+          apt:
+            name: "{{ packages }}"
+            state: present
+            update_cache: true
+          vars:
+            packages:
+              - kubectl
+
+        - name: Initialize kube cluster
+          shell: kubeadm init --v=5 --apiserver-advertise-address {{ ansible_ssh_host }} --service-cidr {{ service_network_cidr }} --pod-network-cidr "{{ pod_network_cidr }}" --upload-certs | tee /var/log/kube-init.log
+          args:
+            creates: /etc/kubernetes/manifests/kube-apiserver.yaml
+
+        - name: Configure kubectl configuration
+          become_user: ansible
+          shell: |
+            mkdir -p $HOME/.kube
+            sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+            sudo chown $(id -u):$(id -g) $HOME/.kube/config
+            exit 0
+          args:
+            creates: $HOME/.kube/config
+
+        - name: Download flannel network plugin
+          get_url: 
+            url: https://github.com/flannel-io/flannel/releases/download/v0.26.1/kube-flannel.yml
+            dest: /tmp/kube-flannel.yml
+
+        - name: Update pod network cidr
+          shell: sed 's/10.244.0.0\/16/{{ pod_network_cidr | replace("/","\/") }}/g' /tmp/kube-flannel.yml > /tmp/kube-flannel-update.yml
+          args:
+            creates: /tmp/kube-flannel-update.yml
+
+        - name: Deploy network plugin
+          become_user: ansible
+          command: kubectl apply -f /tmp/kube-flannel-update.yml
+
+        - name: Extract join command
+          shell: kubeadm token create --print-join-command
+          register: join_command
+          tags:
+            - join_cluster
+        
+        - name: "Add K8S join command to a dummy host"
+          add_host:
+            name:   "K8S_JOIN_COMMAND_HOLDER"
+            join_command:  "{{ join_command.stdout }}"
+          tags:
+            - join_cluster
+
+
+- hosts: workers
+  become: yes
+  tasks:
+
+        - name: Joining kube cluster
+          shell: '{{ hostvars["K8S_JOIN_COMMAND_HOLDER"]["join_command"] }}'
+          tags:
+            - join_cluster
