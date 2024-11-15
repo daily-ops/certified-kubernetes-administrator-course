@@ -1,3 +1,7 @@
+```
+Disclaimer: The repository is forked from https://github.com/kodekloudhub/certified-kubernetes-administrator-course with intention to extend the repository in different aspects for experiments and study purpose. 
+```
+
 # Certified Kubernetes Administrator (CKA) Course
 
 These are notes from the [Certified Kubernetes Administrator Course](https://kodekloud.com/courses/certified-kubernetes-administrator-cka/) hosted on KodeKloud.
