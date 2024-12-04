@@ -6,6 +6,10 @@
       set_fact:
         arch: "{{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}"
   
+    - name: Set network plugin type variables
+      set_fact:
+        network_plugin_type: "weave"
+
     - name: Manage kubeadm repository
       block:
           # To be removed if the setup is done through pre-configured image
@@ -58,10 +62,6 @@
           
 - hosts: master
   become: yes
-  vars:
-    pod_network_cidr: "10.245.0.0/16"
-    pod_subnet: "10.245.0.1/24"
-    service_network_cidr: "10.97.0.0/16"
   tasks:
         # To be removed if the setup is done through pre-configured image
         - name: Install kubectl
@@ -88,9 +88,9 @@
           args:
             creates: $HOME/.kube/config
 
-        - name: Download flannel network plugin
-          get_url: 
-            url: https://github.com/flannel-io/flannel/releases/download/v0.26.1/kube-flannel.yml
+        - name: Upload kube-flannel.yaml into master node
+          copy:
+            src: /home/ansible/certified-kubernetes-administrator-course/kubeadm-clusters/virtualbox/ubuntu/ansible/kube-flannel.yml
             dest: /tmp/kube-flannel.yml
 
         - name: Update pod network cidr
@@ -124,3 +124,7 @@
           shell: '{{ hostvars["K8S_JOIN_COMMAND_HOLDER"]["join_command"] }}'
           tags:
             - join_cluster
+
+
+
+
